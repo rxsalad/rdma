@@ -1,6 +1,6 @@
 # Soft RoCE (RXE)
 
-This guide provides a basic introduction and step-by-step instructions for setting up a Soft-RoCE environment for learning and testing.
+This guide provides a basic introduction and step-by-step instructions for setting up a [Soft-RoCE](https://enterprise-support.nvidia.com/s/article/howto-configure-soft-roce) environment for learning and testing.
 
 ```
               Droplet: soft-roce1
@@ -269,4 +269,3 @@ WARNING: BW peak won't be measured in this run.
  65536      1000             0.00               189.91 		         0.003039
 ---------------------------------------------------------------------------------------
 ```
-
