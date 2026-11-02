@@ -11,36 +11,22 @@
 
 这是 [c-multi-node-cpu.md](c-multi-node-cpu.md)（纯 C 版）的 **Python 简化版**：协议、网卡都相同，只是换成 `pyverbs`（rdma-core 的 Python 绑定），并去掉带宽测试与诊断选项，只保留"建连 → WRITE → READ → 校验"这条主线，适合第一次看 verbs 流程。RDMA 的通用原理见 [rdma.md](rdma.md)。
 
-**状态**：定稿。2026-11-01 在 server-0 / server-1 上实测通过；每个结论的可靠程度见文末附录。
+**状态**：定稿。2026-11-01 在 server-0 / server-1 上实测通过；每个结论的可靠程度见摘要与文末附录（**实测** = 跑出来的；**推断** = 由机制或公开资料推导；**未测** = 没有证据）。
 
-**阅读指南**
+## 章节与阅读指南
 
-| 你想…… | 读 |
-|---|---|
-| 先看结论 | 摘要 |
-| 了解 pyverbs 是什么、靠哪些系统组件运行、系统调用层面发生了什么 | §1 |
-| 准备环境、安装、拷贝脚本 | §2 |
-| 比较两种建连方式 | §3 |
-| 跑 OOB 版 / 跑 CM 版并看代码 | §4 / §5 |
-| 搞清为什么 CM 版必须给 `--src` | §6 |
-| 看重复性、`hop_limit`、接口差异 | §7 |
-| 与原有示例、C 版的区别 | §8 |
-| 排错 | §9 |
-| 查某个结论有多可靠 | 附录 |
-
-## 目录
-
-- [摘要](#sum)
-- [1. pyverbs 简介与系统依赖](#1)
-- [2. 环境与准备](#2)
-- [3. OOB 与 CM：两种建连方式](#3)
-- [4. OOB 版](#4)
-- [5. CM 版](#5)
-- [6. VRF：fabric 网口各自独立的路由表](#6)
-- [7. 实测与接口差异](#7)
-- [8. 与原有 pyverbs 示例、与 C 版的差异](#8)
-- [9. 坑](#9)
-- [附录. 验证状态汇总](#A)
+| 章节 | 内容 | 想……时读 |
+|---|---|---|
+| [摘要](#sum) | 结论速查 | 先看结论 |
+| [1. pyverbs 简介与系统依赖](#1) | pyverbs 是什么、依赖哪些系统组件、运行时发生了什么；**两个 Python 版本**；**能否用 GPU** | 了解 pyverbs 与环境 |
+| [2. 环境与准备](#2) | 实验环境、安装、拷贝脚本 | 动手之前 |
+| [3. OOB 与 CM](#3) | 两种建连方式对照 | 选哪个版本 |
+| [4. OOB 版](#4) / [5. CM 版](#5) | 时间线、运行、输出、代码讲解 | 跑代码、读代码 |
+| [6. VRF](#6) | fabric 网口各自独立的路由表 | 搞清为什么 CM 版必须给 `--src` |
+| [7. 实测](#7) | 重复性、`hop_limit` | 看可信度 |
+| [8. 差异](#8) | 与原有示例、与 C 版的区别；pyverbs 39 的接口差异 | 改写旧脚本 |
+| [9. 坑](#9) | 排错表 | 出问题时 |
+| [附录](#A) | 验证状态汇总 | 查某个结论有多可靠 |
 
 <a id="sum"></a>
 ## 摘要
@@ -50,8 +36,10 @@
 | 两个版本都能在 server-0 / server-1 上跑吗？ | **能**。装好 `python3-pyverbs` 后用 `python3.10` 运行；OOB 版 5 次（含 1 次 client 端 `hop_limit` 用默认值的对照）、CM 版 4 次，运行全部成功、退出码 0 | **实测** |
 | 数据对吗？ | WRITE：server 在自己的内存里看到 client 写入的 40 字节；READ：client 读回 server 预置的 53 字节，内容都与预期一致 | **实测** |
 | pyverbs 是什么、靠什么运行？ | rdma-core 的 Python 绑定（Cython 编译的 C 扩展），本身不实现 RDMA；全部靠系统的 `libibverbs` / `librdmacm` / provider 插件，再经 `/dev/infiniband/uverbsN` 进入宿主机内核驱动 | **实测**（§1） |
-| 在 `n-server2.yaml` 的 Pod 上要准备什么？ | 只需 `apt-get install python3-pyverbs`（39.0-1，依赖由 apt 解决）并拷入脚本，其余由 yaml 提供（§2.2）；运行必须用 `python3.10`：默认 `python3`（3.12）顶层 `import pyverbs` 能成功，`from pyverbs.device import Context` 才报错 | **实测** |
-| 数据面会进内核吗？ | **不会**：发起 WRITE / READ 与轮询完成项期间，`RDMA_VERBS_IOCTL` 为 0 次 | **实测**（`strace`，§1.5） |
+| 在 `n-server2.yaml` 的 Pod 上要准备什么？ | 只需 `apt-get install python3-pyverbs`（39.0-1，依赖由 apt 解决）并拷入脚本，其余由 yaml 提供 | **实测**（§2.2） |
+| 用哪个 Python？ | Pod 里有 **3.10 与 3.12 两个**，默认 `python3` 是 3.12；apt 的 pyverbs **只有 3.10 的二进制**，必须显式用 `python3.10`；PyTorch / CUDA 库只在 3.12 | **实测**（§1.5） |
+| pyverbs 能直接访问 GPU 吗？ | **不能直接**：它只管 RDMA，显存要由 CUDA 库分配，再把地址（`MR(address=…)`）或 dmabuf fd（`DmaBufMR`）交给它；注册显存本身未测，且受 Python 版本分裂所限；GPU 通信建议用 PyTorch over NCCL | Pod 内条件**实测**，其余**未测**（§1.6） |
+| 数据面会进内核吗？ | **不会**：发起 WRITE / READ 与轮询完成项期间，`RDMA_VERBS_IOCTL` 为 0 次 | **实测**（`strace`，§1.4） |
 | CM 版的建连与数据走同一条路径吗？ | 同一块网卡、同一条 fabric 路径，但**用的 QP 不同**：建连报文走 GSI QP（QP1），数据走 RC QP；OOB 版则是建连走 `eth0` 的 TCP | **实测**（§5.7） |
 | CM 版为什么要用 fabric 网口的 IP？ | `rdma_cm` 靠 IP 找 RDMA 设备；填 `eth0` 的 IPv4 报 `Errno: 19, No such device` | **实测** |
 | CM 版 client 为什么必须给 `--src`？ | 每块 fabric 网卡挂在独立的 **VRF** 上，主路由表里没有 fabric 网段的路由；不给报 `Errno: 101, Network is unreachable` | **实测**（§6） |
@@ -67,7 +55,6 @@
 - **来源**：Debian / Ubuntu 的源码包是 `rdma-core`，`python3-pyverbs` 是它拆出来的二进制包（本环境 `python3-pyverbs 39.0-1`）。
 - **用途**：rdma-core 自己用它写测试；适合做原型、教学、快速验证环境。
 - **性能边界**：热路径在 C 库里，但每个操作都由 Python 逐个发起，完成项靠 Python 忙轮询——所以**适合验证流程，不适合测带宽**。
-- **对象一一对应**：
 
 | pyverbs | 对应的 C 对象 | 本实验里的用途 |
 |---|---|---|
@@ -93,22 +80,22 @@
   宿主机内核：ib_uverbs → mlx5_ib → 网卡（PCI 驱动 mlx5_core，固件 40.47.2526）
 ```
 
-容器里只有**用户态**部分（pyverbs、libibverbs、librdmacm、libmlx5）和设备节点；内核驱动与固件在宿主机，由设备节点隔开。所以容器里不需要装任何驱动，但 `/dev/infiniband` 必须被挂进来。
+容器里只有**用户态**部分（pyverbs、libibverbs、librdmacm、libmlx5）和设备节点；内核驱动与固件在宿主机，由设备节点隔开。所以容器里不需要装任何驱动，但 `/dev/infiniband` 必须被挂进来。宿主机内核 6.12 与容器里的 rdma-core 39 能配合工作（本实验已跑通）。
 
 ### 1.3 本环境里查到的静态依赖信息（**实测**，server-0 的 Pod 内）
-
-运行时才发生的事（provider 加载、选驱动等）放在 §1.5。
 
 | 项 | 实测结果 |
 |---|---|
 | 包依赖 | `python3-pyverbs` 声明依赖 `libibverbs1 (>= 36)`、`librdmacm1 (>= 31)`、`ibverbs-providers (>= 37)`、`rdma-core (>= 21)`、`libpython3.10`，并限定 `python3 (<< 3.11)` |
-| 包的内容 | 一批 `*.cpython-310-x86_64-linux-gnu.so`：`device`、`pd`、`mr`、`cq`、`qp`、`wr`、`addr`、`cmid`、`enums`、`cm_enums` 等；另有 `providers/mlx5/`（`mlx5dv` 等 mlx5 专有接口）与 `providers/efa/`。本篇不用 provider 子包 |
-| 链接关系（`ldd`） | `device`、`cmid` 链接 `librdmacm`、`libibverbs`、`libnl-3`、`libnl-route-3`；`qp` 只链接 `libibverbs` 与 libnl。libibverbs、libmlx5 自己也依赖 libnl（用途见 §1.5） |
-| 版本 | `libibverbs1`、`librdmacm1`、`ibverbs-providers`、`rdma-core`、`python3-pyverbs` 全部是 **39.0-1**，同源同版本 |
+| 包的内容 | 一批 `*.cpython-310-x86_64-linux-gnu.so`：`device`、`pd`、`mr`、`cq`、`qp`、`wr`、`addr`、`cmid`、`enums`、`cm_enums` 等；另有 `providers/mlx5/`（`mlx5dv` 等）与 `providers/efa/`。本篇不用 provider 子包 |
+| 链接关系（`ldd`） | `device`、`cmid` 链接 `librdmacm`、`libibverbs`、`libnl-3`、`libnl-route-3`；`qp` 只链接 `libibverbs` 与 libnl。libibverbs、libmlx5 自己也依赖 libnl（用途见 §1.4） |
+| 版本 | `libibverbs1`、`librdmacm1`、`ibverbs-providers`、`rdma-core`、`python3-pyverbs` 全部是 **39.0-1**，同源同版本。仓库里原有示例是在 Ubuntu 24.04（rdma-core 更新）上写的，接口有差异（§8.2） |
 | 设备节点 | `/dev/infiniband/uverbs0`（char 231,192，权限 `crw-rw-rw-`）、`/dev/infiniband/rdma_cm`（char 10,262） |
 | 内核侧 | `uverbs` ABI 版本 6；`mlx5_0` 的 PCI 驱动是 `mlx5_core`（设备 `0000:86:00.0`），固件 `40.47.2526`；`node_type` 为 CA |
 
-### 1.4 运行时进程里有什么（**实测**，`/proc/self/maps` 与 `/proc/self/fd`）
+### 1.4 运行时：进程里有什么，用到哪些系统文件（**实测**）
+
+**进程状态**（`/proc/self/maps`、`/proc/self/fd`）：
 
 | 时刻 | 进程里有什么 |
 |---|---|
@@ -117,52 +104,46 @@
 | 再创建 PD / CQ / MR / QP 之后 | 内存映射增加到 **4 个**（2 可写、2 只读） |
 | CM 版创建 `CMID` 之后 | 额外打开 `/dev/infiniband/rdma_cm` |
 
-映射的来源与用途见 §1.5（阶段 3 与阶段 4）。
+**系统调用追踪**：在 server-0 的 Pod 里装 `strace`（只装在容器层），分别追踪"import → 打开设备 → 创建 PD / CQ / MR / QP"和真实的 `client_oob_cpu.py`。下文的"行号"是 `strace` 日志中的先后顺序。
 
-### 1.5 pyverbs 如何使用这些系统文件（`strace` 追踪，**实测**）
-
-pyverbs 自己不做 RDMA 的事，只是 C 扩展模块；所有事情靠下面这几类系统资源完成。追踪方法：在 server-0 的 Pod 里装 `strace`（只装在容器层），分别追踪"import → 打开设备 → 创建 PD / CQ / MR / QP"和真实的 `client_oob_cpu.py`。下文的"行号"是 `strace` 日志中的先后顺序。
-
-**阶段 1：动态链接（Python 导入 `pyverbs.device` 时）**
+**阶段 1：动态链接**（Python 导入 `pyverbs.device` 时）
 
 1. Python 打开 `/usr/lib/python3/dist-packages/pyverbs/device.cpython-310-….so`；
-2. 这个 `.so` 里只写着 `NEEDED: libibverbs.so.1` 等，**没有 RPATH**，所以交给系统的动态链接器 `ld.so`；
-3. `ld.so` 读 `/etc/ld.so.cache`，并按搜索顺序查找：先试 `/usr/local/cuda/lib64/libibverbs.so.1`（`ENOENT`，这个目录**推测**来自 `LD_LIBRARY_PATH`），再命中 `/lib/x86_64-linux-gnu/libibverbs.so.1`；`librdmacm`、`libnl-3`、`libnl-route-3` 同理（行 810–839）；
+2. 这个 `.so` 里只写着 `NEEDED: libibverbs.so.1` 等，**没有 RPATH**，所以交给动态链接器 `ld.so`；
+3. `ld.so` 读 `/etc/ld.so.cache`，按搜索顺序查找：先试 `/usr/local/cuda/lib64/libibverbs.so.1`（`ENOENT`，这个目录**推测**来自 `LD_LIBRARY_PATH`，未核对环境变量），再命中 `/lib/x86_64-linux-gnu/libibverbs.so.1`；`librdmacm`、`libnl-3`、`libnl-route-3` 同理（行 810–839）；
 4. 此时只是把库映射进进程，**还没碰任何设备**。
 
-**阶段 2：libibverbs 发现设备（`Context(name="mlx5_0")` 时）**
+**阶段 2：libibverbs 发现设备**（`Context(name="mlx5_0")` 时）
 
-| 顺序（行号） | 动作 | 用到的系统文件 |
+| 行号 | 动作 | 用到的系统文件 |
 |---|---|---|
-| 1247–1263 | 建 **`NETLINK_RDMA` 套接字**，发一个请求、连续收到十几条回复。请求的类型值是 `0x1401`，按公开资料对应 RDMA nldev 的设备查询（**推断**）——即向内核询问"有哪些 RDMA 设备" | 内核 RDMA 子系统（经 netlink，用到 libnl） |
+| 1247–1263 | 建 **`NETLINK_RDMA` 套接字**，发一个请求、连续收到十几条回复。请求类型值是 `0x1401`，按公开资料对应 RDMA nldev 的设备查询（**推断**）——向内核询问"有哪些 RDMA 设备" | 内核 RDMA 子系统（经 netlink，用到 libnl） |
 | 1277–1334 | 从 `uverbs19` 倒数到 `uverbs0`，对每个节点做 `stat`：存在的（偶数号）返回设备号，不存在的 `ENOENT` | `/dev/infiniband/uverbsN` |
 | 1336–1435 | 读 `/etc/libibverbs.d/` 下 15 个 `*.driver` 文件；`mlx5.driver` 的内容是 `driver mlx5` | `/etc/libibverbs.d/*.driver` |
-| 1436–1554 | 把 `/usr/lib/x86_64-linux-gnu/libibverbs/` 下的 provider 插件**逐个加载**（行 1526 是 `libmlx5-rdmav34.so`，它是指向 `libmlx5.so.1.22.39.0` 的符号链接） | provider 插件 `.so` |
+| 1436–1554 | 把 `/usr/lib/x86_64-linux-gnu/libibverbs/` 下的 provider 插件**逐个加载**（映射里有 bnxt_re、cxgb4、hns、rxe、siw 等十几个；行 1526 是 `libmlx5-rdmav34.so`，它是指向 `libmlx5.so.1.22.39.0` 的**符号链接**，所以映射里显示的是 libmlx5） | provider 插件 `.so` |
 
-注意：整个追踪里**读 `/sys` 的次数是 0**。这个版本的 libibverbs 靠 netlink 加 `stat` 设备节点发现设备，不读 sysfs。
+整个追踪里**读 `/sys` 的次数是 0**：这个版本的 libibverbs 靠 netlink 加 `stat` 设备节点发现设备，不读 sysfs。
 
 **阶段 3：打开设备，与内核交互**
 
 | 行号 | 动作 | 说明 |
 |---|---|---|
 | 1572 | `open("/dev/infiniband/uverbs0", O_RDWR)` → fd 3 | 整个运行只打开一次 |
-| 1575–1577 | 第一个 `RDMA_VERBS_IOCTL` 返回 `ENOSPC`，第二个成功 | 之后所有命令都走这个 ioctl，整个运行共 **22 次**；**没有**对该 fd 的 `write()`（0 次），即用新式 ioctl 接口，不是旧式 `write` 命令接口 |
+| 1575–1577 | 第一个 `RDMA_VERBS_IOCTL` 返回 `ENOSPC`，第二个成功 | 之后所有命令都走这个 ioctl，整个运行共 **22 次**；对该 fd 的 `write()` 为 **0 次**，即用新式 ioctl 接口，不是旧式 `write` 命令接口 |
 | 1578–1579 | `mmap(4096, PROT_READ, MAP_SHARED, fd, 偏移 0x500000 / 0x700000)` | 两个只读页 |
 | 约 1967 | `mmap(4096, PROT_WRITE, 偏移 0x900000)` | 可写页，在打开设备的过程中映射 |
 | 约 2004 | 创建 PD / CQ / MR / QP 的几个 ioctl 之后，再一个 `mmap(PROT_WRITE, 0x901000)` | 第二个可写页 |
 
-映射数与 §1.4 一致（打开后 3 个：1 个可写、2 个只读；创建之后 4 个）。行 1579–1960 之间约 380 行是 mlx5 provider 的初始化，本篇**没有逐行细看**。
+映射数与上表一致（打开后 3 个、创建之后 4 个）。行 1579–1960 之间约 380 行是 mlx5 provider 的初始化，本篇**没有逐行细看**。
 
-**阶段 4：数据面——没有系统调用**
-
-对真实的 `client_oob_cpu.py` 追踪，数 WRITE 与 READ 期间的系统调用：
+**阶段 4：数据面——没有系统调用**。对真实的 `client_oob_cpu.py` 追踪，数 WRITE 与 READ 期间的系统调用：
 
 | 窗口 | 系统调用 | `RDMA_VERBS_IOCTL` 次数 |
 |---|---|---|
 | QP 就绪 → WRITE 完成（`post_send` + 轮询 CQ） | 3 次 `write`（都是 `print` 到标准输出）、1 次 `pselect6`（脚本里 `time.sleep(0.0005)`） | **0** |
 | WRITE 完成 → READ 完成（含 OOB 通知，再 READ） | OOB 的 `sendto` / `recvfrom` / `poll`、1 次 `pselect6` | **0** |
 
-即发起 WRITE / READ 和取完成项这两步**都没有进内核**。**推断**：`post_send` 靠上面映射的可写页（网卡门铃寄存器页）通知网卡，`poll` 靠读 CQ 所在的内存；映射的存在与"数据面零 ioctl"是实测的，页面的具体用途是通用机制说法。
+即发起 WRITE / READ 和取完成项这两步**都没有进内核**。**推断**：上面映射的可写页是网卡的门铃（doorbell）寄存器页，`post_send` 靠它通知网卡，`poll` 靠读 CQ 所在的内存；映射的存在与"数据面零 ioctl"是实测的，页面的具体用途是通用机制说法，没有读 provider 代码验证。
 
 **汇总：pyverbs 用到哪些系统文件**
 
@@ -177,12 +158,96 @@ pyverbs 自己不做 RDMA 的事，只是 C 扩展模块；所有事情靠下面
 
 **限度**：`strace` 只能看到系统调用，看不到对 mmap 内存的读写；这次追踪只覆盖 OOB 版，CM 版额外走 `rdma_cm`，没有追踪。`strace` 装在容器层，Pod 重建会丢。
 
-### 1.6 几个要点
+### 1.5 Python 版本：Pod 里有两个 Python
 
-1. **Python 版本是硬约束**：apt 的 pyverbs 只有 `cpython-310` 的二进制模块。默认 `python3` 是 3.12（`sys.path` 里包含 `/usr/lib/python3/dist-packages`）：顶层 `import pyverbs` 会**成功**（`__init__.py` 是纯 Python），容易误以为装好了；`from pyverbs.device import Context` 才报 `No module named 'pyverbs.device'`。所以必须用 **`python3.10`**。
-2. **同源同版本**：pyverbs、libibverbs、librdmacm、provider 全是 rdma-core 39.0。仓库里原有示例是在 Ubuntu 24.04（rdma-core 更新）上写的，接口有差异，见 §7.3。
-3. **依赖全在容器层**：`apt-get install` 装在容器可写层，Pod 重建后会丢。
-4. **版本配合**：宿主机内核 6.12 与容器里的 rdma-core 39 能配合工作（本实验已跑通）。
+**现象**（**实测**，server-0）：
+
+| | Python 3.10 | Python 3.12 |
+|---|---|---|
+| 位置 | `/usr/bin/python3.10`（Ubuntu 22.04 自带） | `/usr/bin/python3.12`（镜像额外安装） |
+| 默认 `python3` | 否 | **是**（`readlink -f` 指向它） |
+| `pip` | 没有（`No module named pip`） | 默认 `pip` 属于它 |
+| pyverbs（apt 包） | 二进制模块可用 | 只有纯 Python 顶层包，子模块导入失败 |
+| `torch`、`cupy`、`cuda-python`、`pynvml` | 没有 | 有（`/usr/local/lib/python3.12/dist-packages/`） |
+
+3.12 的 `sys.path` 里包含 `/usr/lib/python3/dist-packages`，所以顶层 `import pyverbs` 会**成功**（`__init__.py` 是纯 Python），容易误以为装好了；`from pyverbs.device import Context` 才报 `No module named 'pyverbs.device'`。
+
+**来源**：Pod 用的是 vLLM 官方镜像 `vllm/vllm-openai:cu130-nightly`（`n-server2.yaml` 第 50 行，`imagePullPolicy: Always`；本次拉到的 digest 以 `sha256:3dbe092e…` 开头，**实测**）。3.10 是 Ubuntu 22.04 自带；3.12 是 apt 包 `python3.12 3.12.13-1+jammy1`（**实测**），版本号后缀说明来自 PPA，**推断**是 deadsnakes，没有核对官方 Dockerfile。PyTorch、vLLM 等是 pip 装进 3.12 的。`cu130-nightly` 是滚动标签，Pod 重建后可能拉到不同的镜像，下面的细节会跟着变。
+
+**原因**：pyverbs 是 Cython 编译的 C 扩展，文件名带 Python 版本（`device.cpython-310-….so`）。apt 包 `python3-pyverbs` 把它们放进系统共享目录 `/usr/lib/python3/dist-packages/`，依赖里写着 `python3 (<< 3.11)` 与 `libpython3.10`（**实测**）。这是**打包**的限制：包只含 3.10 的二进制，安装时 apt 没有做任何选择；不是 pyverbs 本身的限制。
+
+**运行时怎么选**：没有自动选择，**由命令里写的解释器决定**（**实测**）：
+
+| 写法 | 用的版本 | 说明 |
+|---|---|---|
+| `python3 x.py` | **3.12** | `python3` 默认指向 `/usr/bin/python3.12` |
+| `python3.10 x.py` | 3.10 | 按版本号指定；**本篇所有脚本都这样运行** |
+| `/usr/bin/python3.10 x.py` | 3.10 | 绝对路径，不受 `PATH` 影响 |
+| `./x.py` | **3.12** | 四个脚本第一行是 `#!/usr/bin/env python3`，直接执行时选的是 `python3`，会导入失败；要么写成 `python3.10 x.py`，要么把第一行改成 `python3.10`（脚本**未改**） |
+
+- `pip` 要与 Python 配套：默认 `pip` 属于 3.12；3.10 没有 pip，要装包得先装 `pip`（**未测**）。直接 `pip install …` 装的是 3.12，对 `python3.10` 无效。
+- `PYTHONPATH` 对两个版本都生效，设置时要小心混进另一个版本的包。
+- `kubectl exec`、`bash -lc` 这类外层包装不改变选择。
+- **不建议**把默认 `python3` 改成 3.10：PyTorch、vLLM 等依赖 3.12，改动可能影响容器里的其他东西。
+
+**能不能用到 3.12 里**（PyPI 的情况只查了元数据，**没有安装任何东西**）：
+
+| 办法 | 现状 |
+|---|---|
+| `pip install pyverbs`（59.0 / 57.0） | PyPI 上这两个版本**只有源码包**，pip 会现场编译；源码版本与系统 libibverbs 39.0 不一致，可能编译不过或缺符号 |
+| `pip install` 56.0rc0 / 56.0rc1 | 有 `cp312` 的 **wheel**，但是预发布版、版本远新于 39.0，且 manylinux wheel 通常自带一份库，与系统 mlx5 provider 能否配合没有把握 |
+| 用 rdma-core **39.0 源码**自行编译（`python3.12`） | 与系统库同版本，最稳；源码包能下到，`gcc`、`ninja`、`python3.12-dev`、`libibverbs-dev 39.0-1` 已有，缺 `cmake` 与 `Cython`。**未做**：安装工具与编译这一步被权限拦截，没有继续 |
+
+**后果**：pyverbs（3.10）与 PyTorch / CUDA 库（3.12）**不能在同一个进程里同时使用**。本篇只用 CPU 内存，不受影响；做 GPU 版必须先处理这一点（§1.6）。
+
+**检测**：
+
+```bash
+ls /usr/bin/python3*; readlink -f $(which python3)      # 有哪些、默认指向谁
+pip --version; python3.10 -m pip --version              # pip 属于哪个版本
+for py in python3.10 python3.12; do echo == $py
+  $py -c "from pyverbs.device import Context; print('pyverbs ok')" 2>&1 | tail -1
+  $py -c "import torch; print(torch.__file__)" 2>&1 | tail -1
+done
+python3 -c "import sys; print(sys.executable, sys.version_info[:2])"   # 当前用的是哪个
+```
+
+脚本里可加 `assert sys.version_info[:2] == (3, 10)`（建议写法，**未加进脚本**）。
+
+### 1.6 pyverbs 与 GPU
+
+**结论：pyverbs 不能"直接"支持 GPU，但可以间接用上。** 本篇的脚本只用 CPU 内存，GPU 版没有做过。
+
+| 层面 | 结论 |
+|---|---|
+| GPU 本身的操作：分配显存、拷贝、启动 kernel | **不支持**：pyverbs 里没有这类接口，显存要由 PyTorch、cupy、cuda-python 等分配 |
+| 把显存交给网卡（peermem 路径） | `MR(pd, length, access, address=ptr)` 接口上可以接收一个已有地址（文档字符串写明）。传入 CUDA 分配的设备指针能否注册成功，**未测** |
+| dmabuf 路径 | pyverbs 有 `DmaBufMR` 与 `DmaBuf`，但 `DmaBuf` 的文档写明它经 **DRI 设备**（需 `render` 组）分配，面向 AMD 一类 GPU，**对 NVIDIA 没用**；`DmaBufMR` 能否接收由 CUDA（`cuMemGetHandleForAddressRange`）导出的 fd，文档没写，**未测** |
+
+pyverbs 与 GPU 之间只有一个接触点：把"地址或 dmabuf fd"递给 `MR` / `DmaBufMR`。注册之后，WRITE / READ 的发起方式与 CPU 内存相同，VRF、`--src`、GID 的处理也不变。
+
+**Pod 里的条件**（**实测**，server-0）：
+
+| 项 | 结果 |
+|---|---|
+| GPU 与驱动 | 8×B300，驱动 590.48.01 |
+| `nvidia_peermem` | `lsmod` 里有，`/sys/module/nvidia_peermem` 存在 |
+| CUDA 工具 | `/usr/local/cuda`（13.0，有 `nvcc`、`libcuda.so.1`）；NCCL 2.28.9 |
+| `python3`（3.12） | `torch 2.11+cu130`（8 卡可用、带 NCCL）、`cupy`、`cuda-python 13.2`（含 `cuMemGetHandleForAddressRange`）、`pynvml` |
+| `python3.10` | 以上都**没有** |
+
+**做 pyverbs GPU 版的路线**（每一步都**未测**）：先解决 Python 版本分裂（给 3.10 装 CUDA 库，或把 pyverbs 编译到 3.12，§1.5）→ 用 CUDA 分配显存 → peermem 路径用 `MR(..., address=ptr)`，dmabuf 路径导出 fd 后交给 `DmaBufMR` → 之后与 CPU 版相同。GDR 的带宽还取决于 GPU 与网卡的就近关系（[c-multi-node.md §3.2](c-multi-node.md#3-2)）。
+
+**该选 PyTorch over NCCL 还是 pyverbs？**
+
+| 目标 | 建议 | 理由 |
+|---|---|---|
+| 真实训练或推理里的 GPU 通信 | **PyTorch + NCCL** | NCCL 已处理拓扑、多 rail、多 QP、GDR、`NCCL_IB_TC` 等调优；pyverbs 只是单次操作，由 Python 逐个发起，没有集合通信与拓扑感知 |
+| 带宽、延迟基准 | **NCCL tests 或 C 版** | Python 的开销会掩盖网络性能（§8.3） |
+| 理解 verbs 流程、验证环境、写原型 | **pyverbs** | 流程清楚、代码短；GPU 版只是可选扩展 |
+| 要贴近硬件的 GPU RDMA | **C 版**（[c-multi-node.md](c-multi-node.md)，用 `ibv_reg_dmabuf_mr`，按该文档已在这套集群上跑通；本次未重跑） | 无需处理 Python 版本分裂 |
+
+除非目的是教学，否则不建议用 pyverbs 做 GPU 通信；生产或性能相关的工作用 PyTorch over NCCL。
 
 <a id="2"></a>
 ## 2. 环境与准备
@@ -218,8 +283,8 @@ kubectl exec server-0 -- bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get instal
 kubectl exec server-1 -- bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pyverbs'
 ```
 
-- 运行时必须用 `python3.10`（§1.6）。
-- 装在容器可写层，**Pod 重建后要重装**；想固化可把 `python3-pyverbs` 加进 yaml 的 `apt install` 行（**未测**：未重建 Pod 验证）。
+- 运行时必须用 `python3.10`（§1.5）。
+- 装在容器可写层，**Pod 重建后要重装**（脚本也要重新拷）；想固化可把 `python3-pyverbs` 加进 yaml 的 `apt install` 行（**未测**：未重建 Pod 验证）。
 - 其余前提（宿主机 mlx5 驱动、可锁定内存、RoCE v2 GID、网络互通）与主机内存 C 版相同，见 [c-multi-node-cpu.md §1.3](c-multi-node-cpu.md#1-3)。**不需要** OFED、CUDA。
 
 ### 2.3 拷贝脚本
@@ -254,7 +319,7 @@ for f in server_oob_cpu server_cm_cpu; do kubectl exec -i server-1 -- bash -c "c
 | `traffic_class` | `--tc`，默认 104 | **没有设置**（等于 0），见 §5.6 |
 | 对 VRF 的敏感度 | 不依赖 IP 路由，不受影响 | **`--src` 必填**（§6） |
 
-OOB 版里，OOB 只传连接信息和 1 字节同步，数据走 RDMA；`eth0` 上的 TCP 不是 RDMA 连接，只是临时的信令通道。**两个版本都一样：WRITE 对 server 是"无声"的**——server 不知道数据已到，所以都要另外通知它去看（见 [rdma.md §5.4](rdma.md#5)）。
+OOB 只传连接信息和 1 字节同步，数据走 RDMA；`eth0` 上的 TCP 不是 RDMA 连接，只是临时的信令通道。**两个版本都一样：WRITE 对 server 是"无声"的**——server 不知道数据已到，所以都要另外通知它去看（见 [rdma.md §5.4](rdma.md#5)）。
 
 两个版本共用同一个内存布局（server / client 各注册一块内存，各取一半）：
 
@@ -554,7 +619,7 @@ CM 版里，"先建连接、后传数据"是不是走同一条路径？能不能
 |---|---|
 | **代码层** | **能分清**：建连是 `CMID(...)` / `connect()` / `accept()`；交换内存信息是一条 `post_send`；数据是 `post_write()` / `post_read()`；协调消息（`'W'` `'K'` `'Q'`）是 `post_send` / `post_recv` |
 | **网络路径层** | **同一条路径，但用的 QP 不同**：建连和数据都走同一块网卡、同一个端口、同一对 fabric IP（经 VRF 与网关，§6）；建连报文走 **GSI QP（QP1）**（上表），数据走建好的 **RC QP**（`rdma res show` 里是另一个 QP 号，如 `lqpn 2690`）。OOB 版则是建连走 `eth0` 的 TCP（另一张网），GSI 不变 |
-| **连接建好之后** | **不分开**：本篇 CM 版脚本里的协调消息（内存信息、`'W'` `'K'` `'Q'`）用 RDMA SEND / RECV 发，与 WRITE / READ **在同一个 RC QP 上**，只能靠操作类型（SEND 还是 WRITE / READ）和程序含义区分。OOB 版则是协调消息在 TCP、数据在 RDMA，界线更清楚 |
+| **连接建好之后** | **不分开**：CM 版脚本里的协调消息（内存信息、`'W'` `'K'` `'Q'`）用 RDMA SEND / RECV 发，与 WRITE / READ **在同一个 RC QP 上**，只能靠操作类型（SEND 还是 WRITE / READ）和程序含义区分。OOB 版则是协调消息在 TCP、数据在 RDMA，界线更清楚 |
 
 **没验证的**：
 - client 每次 +3、server 每次 +2，**推断**对应 CM 握手里的几类消息（client 发 REQ、RTU 与断开请求，server 发 REP 与断开应答），但每个增量对应哪条消息，没有抓包验证（Pod 里没有能抓 RDMA 报文的工具）；
@@ -630,7 +695,7 @@ rdma res show cm_id                           # 当前 CM 连接用的设备与�
 ```
 
 <a id="7"></a>
-## 7. 实测与接口差异
+## 7. 实测
 
 ### 7.1 正确性与重复性
 
@@ -654,11 +719,31 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 - **未测**：**两端都用默认值**的情形（READ 的数据由 server 端 QP 发出，server 方向的 `hop_limit` 在本实验里仍是 64）；
 - 脚本里仍显式设 64：对不同网络环境更稳妥。
 
-### 7.3 为了跑通，踩到的接口差异（**实测**，rdma-core 39 / pyverbs 39.0-1）
+<a id="8"></a>
+## 8. 差异
+
+### 8.1 与仓库里原有的 `client_oob.py` / `server_oob.py` / `client_cm.py` / `server_cm.py`
+
+原脚本（见 [soft-roce-local.MD](soft-roce-local.MD)）在 Soft-RoCE 环境、较新的 rdma-core 上写成，用的是 SEND / RECV。本篇脚本的改动：
+
+| 项 | 原脚本 | 本篇脚本 | 原因 |
+|---|---|---|---|
+| enum 导入 | `libibverbs_enums` / `librdmacm_enums` | `pyverbs.enums` / `pyverbs.cm_enums` | 这个版本里原模块不存在（§8.2） |
+| 设备 / GID 下标 | `rxe_eth1` / 1 | `mlx5_*` / 3 | 本集群的设备名；`gid[1]` 是 `fe80::` 链路本地，不能跨机 |
+| 地址 | 写死的 IP | `--server` / `--bind` / `--src` 参数 | 不同环境的 IP 不同；CM 版还要用 fabric 网口的 IP |
+| 操作 | SEND / RECV | **RDMA WRITE + READ** | 本篇要演示"访问对端内存" |
+| QP 权限（OOB 版） | 默认 | 开 `REMOTE_WRITE` / `REMOTE_READ` | 单边操作需要 |
+| `path_mtu`（OOB 版） | 固定 1024 | 取端口 `active_mtu`（4096） | 与网卡能力一致 |
+| `traffic_class` / `hop_limit`（OOB 版） | 未设置 | 显式设置（104 / 64） | 与 C 版一致；见 §7.2 |
+| CM 的 `dev_name` / `port_num` | 使用 | 不使用 | 本版没有这两个属性（§8.2） |
+
+### 8.2 pyverbs 39.0 的接口差异（**实测**，rdma-core 39）
+
+为了跑通，踩到的差异：
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| `from pyverbs.device import Context` 报 `No module named 'pyverbs.device'` | 用了默认 `python3`（3.12），只有 3.10 的二进制模块；改用 `python3.10`（§1.6） |
+| `from pyverbs.device import Context` 报 `No module named 'pyverbs.device'` | 用了默认 `python3`（3.12），只有 3.10 的二进制模块；改用 `python3.10`（§1.5） |
 | `from pyverbs.libibverbs_enums import …` 报 `ModuleNotFoundError` | 这个版本的 enum 在 **`pyverbs.enums`** |
 | `from pyverbs.librdmacm_enums import …` 报 `ModuleNotFoundError` | CM 相关枚举（`rdma_port_space`、`RAI_PASSIVE` 等）在 **`pyverbs.cm_enums`** |
 | `GID("fd02:0:400:52e::1")` 报 `Invalid GID value` | GID 字符串必须写成**完整 8 段**，不能用 `::` 缩写；脚本用 `str(gid)` 传递，天然是完整形式（`AddrInfo` 的 IP 参数则可以用缩写） |
@@ -668,25 +753,7 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 | `rdma_cm` 的 TOS 选项 | 本版 `cm_enums` 只暴露了 `RDMA_OPTION_ID` 与 `RDMA_OPTION_ID_ACK_TIMEOUT`，**没有** TOS 常量 |
 | `inspect.signature` 对 pyverbs 的类报 `no signature found` | 它们是 Cython 编译的，用 `help()` / `__init__.__doc__` 看参数 |
 
-<a id="8"></a>
-## 8. 与原有 pyverbs 示例、与 C 版的差异
-
-### 8.1 与仓库里原有的 `client_oob.py` / `server_oob.py` / `client_cm.py` / `server_cm.py`
-
-原脚本（见 [soft-roce-local.MD](soft-roce-local.MD)）在 Soft-RoCE 环境、较新的 rdma-core 上写成，用的是 SEND / RECV。本篇脚本的改动：
-
-| 项 | 原脚本 | 本篇脚本 | 原因 |
-|---|---|---|---|
-| enum 导入 | `libibverbs_enums` / `librdmacm_enums` | `pyverbs.enums` / `pyverbs.cm_enums` | 这个版本里原模块不存在（§7.3） |
-| 设备 / GID 下标 | `rxe_eth1` / 1 | `mlx5_*` / 3 | 本集群的设备名；`gid[1]` 是 `fe80::` 链路本地，不能跨机 |
-| 地址 | 写死的 IP | `--server` / `--bind` / `--src` 参数 | 不同环境的 IP 不同；CM 版还要用 fabric 网口的 IP |
-| 操作 | SEND / RECV | **RDMA WRITE + READ** | 本篇要演示"访问对端内存" |
-| QP 权限（OOB 版） | 默认 | 开 `REMOTE_WRITE` / `REMOTE_READ` | 单边操作需要 |
-| `path_mtu`（OOB 版） | 固定 1024 | 取端口 `active_mtu`（4096） | 与网卡能力一致 |
-| `traffic_class` / `hop_limit`（OOB 版） | 未设置 | 显式设置（104 / 64） | 与 C 版一致；见 §7.2 |
-| CM 的 `dev_name` / `port_num` | 使用 | 不使用 | 本版没有这两个属性 |
-
-### 8.2 与 C 版（[c-multi-node-cpu.md](c-multi-node-cpu.md)）
+### 8.3 与 C 版（[c-multi-node-cpu.md](c-multi-node-cpu.md)）
 
 | | pyverbs 版（本篇） | C 版 |
 |---|---|---|
@@ -707,7 +774,7 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 
 | # | 坑 / 注意 | 说明 |
 |---|---|---|
-| 1 | 默认 `python3`（3.12）导入不了 pyverbs 的子模块 | 顶层 `import pyverbs` 会成功，容易误以为装好了；`from pyverbs.device import …` 才失败。要用 `python3.10`（§1.6） |
+| 1 | 默认 `python3`（3.12）导入不了 pyverbs 的子模块 | 顶层 `import pyverbs` 会成功，容易误以为装好了；`from pyverbs.device import …` 才失败。要用 `python3.10`。Pod 里同时有 3.10 与 3.12，PyTorch / CUDA 库只在 3.12，**pyverbs 与它们不能同进程**（§1.5） |
 | 2 | Pod 重建后 pyverbs 与脚本都没了 | 装在容器层；重建后重装并重新拷贝（§2） |
 | 3 | 输出重定向到文件时日志是空的 | **实测遇到**：Python 在输出不是终端时会缓冲，server 的"监听"行要等进程结束才出现，脚本里轮询日志会白等到超时。运行时加 **`python3.10 -u`** |
 | 4 | server 要先启动 | server 一次性：处理完一个 client 就退出；client 没有重试，连不上就报错 |
@@ -721,7 +788,7 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 | # | 坑 / 注意 | 说明 |
 |---|---|---|
 | 9 | GID 下标要选 RoCE v2 的非链路本地项 | 本集群是 3；用 `ctx.query_gid(1, i)` 与 `query_gid_type(1, i)` 查（类型 1 才是 RoCE v2，`fe80::` 不能跨机） |
-| 10 | GID 字符串要完整 8 段 | 不能写 `::` 缩写（§7.3） |
+| 10 | GID 字符串要完整 8 段 | 不能写 `::` 缩写（§8.2） |
 | 11 | QP 和 MR 的权限都要开 | server 的 QP 要 `REMOTE_WRITE` / `REMOTE_READ`，MR 也要，对端的 WRITE / READ 才被接受 |
 | 12 | `--server` 填 server 的 `eth0` IP | OOB 的 TCP 走 `eth0`，不是 fabric 地址 |
 
@@ -754,16 +821,24 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 | 结论 | 状态 |
 |---|---|
 | `python3-pyverbs 39.0-1` 的依赖声明、文件内容、`ldd` 链接关系；`libibverbs1` / `librdmacm1` / `ibverbs-providers` / `rdma-core` 均为 39.0-1 | **实测** |
-| 默认 `python3`（3.12）只能导入顶层包、导入不了 `pyverbs.device` 等子模块；`python3.10` 可用 | **实测** |
-| 打开设备前后进程里的库、fd、对 `uverbs0` 的内存映射（3 个 → 4 个）；`libmlx5-rdmav34.so` 是指向 `libmlx5.so.1.22.39.0` 的符号链接；`/etc/libibverbs.d` 有 15 个文件、`mlx5.driver` = `driver mlx5` | **实测** |
+| 打开设备前后进程里的库、fd、对 `uverbs0` 的内存映射（3 个 → 4 个）；`libmlx5-rdmav34.so` 是符号链接；`/etc/libibverbs.d` 有 15 个文件、`mlx5.driver` = `driver mlx5` | **实测** |
 | CM 版额外打开 `/dev/infiniband/rdma_cm`；`uverbs` ABI 版本 6、PCI 驱动 `mlx5_core`、固件 40.47.2526 | **实测** |
-| libibverbs 初始化时建 `NETLINK_RDMA` 套接字并收发；随后对 `/dev/infiniband/uverbs19…0` 逐个 `stat`；读 `/etc/libibverbs.d/` 的 15 个 `.driver` 文件并加载 provider 插件；整个追踪里读 `/sys` 的次数为 0 | **实测**（`strace`） |
-| 打开 `uverbs0` 一次；之后 `RDMA_VERBS_IOCTL` 共 22 次、对该 fd 的 `write()` 为 0 次；`mmap` 共 4 个 4096 字节页（偏移 0x500000 / 0x700000 只读，0x900000 / 0x901000 可写） | **实测**（`strace`） |
-| WRITE / READ 的发起与完成轮询期间，没有 `RDMA_VERBS_IOCTL`（数据面不进内核） | **实测**（真实 `client_oob_cpu.py` 的 `strace`） |
-| 对 `uverbs0` 的可写映射是网卡门铃页，`post_send` 经它通知网卡、`poll` 读 CQ 内存，使热路径不进内核 | **推断**（通用机制） |
-| netlink 请求类型 `0x1401` 对应 RDMA nldev 的设备查询 | **推断**（按公开资料的常量） |
-| `ld.so` 先试 `/usr/local/cuda/lib64`（`ENOENT`）再命中 `/lib/x86_64-linux-gnu`，原因是 `LD_LIBRARY_PATH` | **推断**（搜索顺序实测，原因未核对环境变量） |
-| mlx5 provider 初始化期间（约 380 行系统调用）具体做了什么；CM 版的系统调用序列 | **未查 / 未追踪** |
+| `strace`：libibverbs 初始化建 `NETLINK_RDMA` 套接字，对 `uverbs19…0` 逐个 `stat`，读 15 个 `.driver` 文件并加载 provider；读 `/sys` 0 次；打开 `uverbs0` 一次、`RDMA_VERBS_IOCTL` 共 22 次、`write()` 0 次；`mmap` 共 4 个 4096 字节页（0x500000 / 0x700000 只读，0x900000 / 0x901000 可写） | **实测** |
+| WRITE / READ 的发起与完成轮询期间没有 `RDMA_VERBS_IOCTL`（数据面不进内核） | **实测**（真实 `client_oob_cpu.py` 的 `strace`） |
+| 可写映射是网卡门铃页，使热路径不进内核；netlink 类型 `0x1401` 对应 nldev 设备查询 | **推断** |
+| `ld.so` 先试 `/usr/local/cuda/lib64`（`ENOENT`）再命中 `/lib/x86_64-linux-gnu`，原因是 `LD_LIBRARY_PATH` | **推断**（搜索顺序实测，环境变量未核对） |
+| mlx5 provider 初始化期间（约 380 行系统调用）做了什么；CM 版的系统调用序列 | **未查 / 未追踪** |
+
+**Python 版本与 GPU**
+
+| 结论 | 状态 |
+|---|---|
+| 默认 `python3`（3.12）只能导入顶层包、导入不了 `pyverbs.device`；`python3.10` 可用 | **实测** |
+| Pod 里有 3.10（系统自带）与 3.12（镜像加装，默认）；`torch` / `cupy` / `cuda-python` 只在 3.12；默认 `pip` 属于 3.12，3.10 无 pip | **实测**（server-0；server-1 未核对） |
+| 镜像 `vllm/vllm-openai:cu130-nightly`；3.12 是 apt 包 `python3.12 3.12.13-1+jammy1`（来源 PPA，是否 deadsnakes） | **实测** / **推断** |
+| PyPI 的 `pyverbs`：59.0、57.0 只有源码包；56.0rc0 / rc1 有 cp312 wheel（预发布） | **实测**（只查了元数据，未安装） |
+| Pod 里 GPU（8×B300）、`nvidia_peermem`、CUDA 13.0、NCCL 2.28.9 的存在；pyverbs 有 `MR(address=…)`、`DmaBufMR`、`DmaBuf`（`DmaBuf` 走 DRI） | **实测** |
+| 在 3.12 里编译或安装 pyverbs；在 3.10 里装 CUDA 库；用 pyverbs 注册 CUDA 显存（peermem 或 dmabuf）并做 WRITE / READ；`pip` 装进 3.10 | **未测** |
 
 **接口差异**
 
@@ -777,13 +852,13 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 | 结论 | 状态 |
 |---|---|
 | GID 表：下标 0/1 为 `fe80::`、2/3 为 `fd02:…`，类型 1/3 为 RoCE v2；端口 `active_mtu` = 5（4096） | **实测** |
-| fabric 网口的 IPv6 地址：server-0 `fabric0` = `fd02:0:400:52e::1`、server-1 `fabric14` = `fd02:0:0:527::1`；`rdma link` 显示 `mlx5_0 ↔ fabric0` | **实测** |
+| fabric 网口地址：server-0 `fabric0` = `fd02:0:400:52e::1`、server-1 `fabric14` = `fd02:0:0:527::1`；`rdma link` 显示 `mlx5_0 ↔ fabric0` | **实测** |
 | CM 版实际使用的设备：client `mlx5_0/1`、server `mlx5_14/1`，QP 类型 RC（`rdma res show`） | **实测** |
 | CM 版填 `eth0` 的 IPv4 报 `Errno: 19, No such device`；不给 `--src` 报 `Errno: 101, Network is unreachable`，给了则成功 | **实测** |
 | `rdma_cm` 依据 IP 找 RDMA 设备（IP → netdev → RDMA 设备） | **推断**（机制；与 `rdma res show` 的结果一致） |
 | 每跑一次 CM 版，client 的 GSI QP `sq-psn` +3、server 的 +2（两次一致）；跑 OOB 版则不变 | **实测** |
 | 上述增量对应 CM 握手的 REQ / REP / RTU / 断开等消息；`rdma_cm` 报文经 GSI QP 发出 | **推断** / 公开资料（未抓包） |
-| CM 版建连后的协调消息与数据在同一个 RC QP 上（脚本设计，SEND / RECV 与 WRITE / READ 共用） | 代码事实 |
+| CM 版建连后的协调消息与数据在同一个 RC QP 上（脚本设计） | 代码事实 |
 | server-0 上 `fabricN` 各属于一个 VRF（`fabric0` → `vrf100` → 表 100 … `fabric14` → `vrf114` → 表 114）；每张表只有本网口 /64 与 `fd02::/24 via …::2 onlink`；主表无 `fd02::` 路由 | **实测**（server-0） |
 | `ip -6 route get` 不指定出接口 → `Network is unreachable`；指定 `oif fabric0` 或 `vrf vrf100` → 走网关；`ping6` 须 `-I fabric0` | **实测** |
 | 邻居表里只有网关、没有对端主机；因此 RoCE 报文的目的 MAC 应是网关的 MAC | 邻居表**实测**；"目的 MAC 是网关"为**推断**（未抓包） |
@@ -797,8 +872,8 @@ RoCE v2 的地址向量里有 `hop_limit`（IP 头的 TTL）。OOB 版显式设 
 | 为什么默认 `hop_limit = 1` 仍然可用；两端都用默认值的情形 | **未查明** / **未测** |
 | VRF 由谁创建；server-1 上是否同样的 VRF 布局（仅看到 `fabric14` 的网关邻居）；NCCL 在 VRF 下的行为 | **未查 / 未测** |
 | CM 版 `traffic_class`（默认 0）；是否能用 `set_option` 设 TOS；不带 `IBV_SEND_SIGNALED` 是否仍有完成项 | **未测** |
-| 非默认 `traffic_class`（如 0）下的 OOB 版行为；SEND / RECV 之外的 CM 事件处理；多 QP；错误路径（权限不足、rkey 错误）；带宽与延迟 | **未测** |
+| 非默认 `traffic_class` 下的 OOB 版行为；SEND / RECV 之外的 CM 事件处理；多 QP；错误路径（权限不足、rkey 错误）；带宽与延迟 | **未测** |
 
 ---
 
-*环境：server-0 与 server-1（StatefulSet `server` 的两个 Pod，`n-server2.yaml`，各 8×B300，RoCE v2 / 400 Gb/s，Ubuntu 22.04，rdma-core 39，python3-pyverbs 39.0-1，Python 3.10）；实验日期 2026-11-01；代码：`pyverbs-example/server_oob_cpu.py`、`client_oob_cpu.py`、`server_cm_cpu.py`、`client_cm_cpu.py`，均含中文注释。*
+*环境：server-0 与 server-1（StatefulSet `server` 的两个 Pod，`n-server2.yaml`，镜像 `vllm/vllm-openai:cu130-nightly`，各 8×B300，RoCE v2 / 400 Gb/s，Ubuntu 22.04，rdma-core 39，python3-pyverbs 39.0-1，Python 3.10 / 3.12 并存）；实验日期 2026-11-01；代码：`pyverbs-example/server_oob_cpu.py`、`client_oob_cpu.py`、`server_cm_cpu.py`、`client_cm_cpu.py`，均含中文注释。*
