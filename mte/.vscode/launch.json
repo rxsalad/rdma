@@ -1,0 +1,46 @@
+{
+  // MTE 的 Python 调试配置（VS Code 通过 code tunnel 连到 Pod，工作区 = /vllm-workspace）。
+  // 需要在"已连接 Pod 的窗口"里装 Python Debugger 扩展（ms-python.debugpy），点 "Install in Tunnel"。
+  // 先启动 server（server-1），再启动 client（server-0）；两边各在自己的 Pod 的窗口里调试。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 在 server-1 的窗口里选这个。
+      "name": "MTE server_gpu (server-1, GPU7 / mlx5_14)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/server_gpu.py",
+      "args": [
+        "--host", "10.133.0.253",   // 本机 eth0 的 IP（MTE 的 local_hostname）
+        "--dev", "mlx5_14",         // 与 GPU7 同一个 PCIe 交换机下的网卡
+        "--gpu", "7",
+        "--size-mib", "64"          // 两端要一致
+      ],
+      "python": "/usr/bin/python3", // Python 3.12：torch 与 MTE 都装在这里
+      "env": { "PYTHONPATH": "${workspaceFolder}/mte13" },   // MTE 的 CUDA 13 版装在这个目录
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true            // 只调自己的代码；想进 torch 内部改成 false
+    },
+    {
+      // 在 server-0 的窗口里选这个；server 已经在等待之后再启动。
+      "name": "MTE client_gpu (server-0, GPU0 / mlx5_0)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/client_gpu.py",
+      "args": [
+        "--host", "10.133.1.12",
+        "--dev", "mlx5_0",
+        "--gpu", "0",
+        "--peer", "10.133.0.253",   // server 的 eth0 IP
+        "--size-mib", "64",
+        "--repeat", "3"
+      ],
+      "python": "/usr/bin/python3",
+      "env": { "PYTHONPATH": "${workspaceFolder}/mte13" },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
