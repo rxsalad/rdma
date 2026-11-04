@@ -2,7 +2,7 @@
 
 本文是 RDMA 的**原理性介绍**：它是什么、一块网卡为什么有两套接口、由哪些对象组成、一次操作怎么走、为什么要注册内存、传输类型、GPUDirect RDMA、流量类别与交换机队列。内容是通用知识（公开资料的一般说法），**不依赖本仓库的环境**；正文不放本文自己的实测数据，少数地方会引用本仓库其他文章的实测结论，并标明出处。
 
-- 想看本仓库的实验、实测结论、环境与上手步骤：见 [README.md](README.md)。
+- 想看本仓库的实验、实测结论、环境与上手步骤：见 [README-CN.md](README-CN.md)。
 - 文中标 *（实验见 …）* 的地方，指向仓库里对应的实测文章。
 - 个别论断本仓库未验证，文中会明确标出。
 
@@ -502,7 +502,7 @@ NVIDIA（Mellanox）公开文档里常见的约定（**不是强制**，具体�
 
 验证思路：看网卡 `ethtool -S` 里 pause / prio / ecn / cnp / out_of_sequence / retransmit / discard 类计数器，以及交换机各队列的丢包、PFC、ECN、缓冲占用；确认 RDMA 流量进入预期队列、拥塞时 ECN 先于 PFC、没有意外丢包与重传。
 
-*（完整术语表与 QoS 说明见 [roce-swtich.md](roce-swtich.md)；本集群上 `-t 104` 的实测影响见 [README.md](README.md#tc)。）*
+*（完整术语表与 QoS 说明见 [roce-swtich.md](roce-swtich.md)；本集群上 `-t 104` 的实测影响见 [README-CN.md](README-CN.md#tc)。）*
 
 <a id="10"></a>
 ## 10. 与单机 GPU P2P 的概念对照
